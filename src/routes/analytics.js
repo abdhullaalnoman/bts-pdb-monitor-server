@@ -1,7 +1,3 @@
-// src/routes/analytics.js
-// Analytics APIs: per-BTS summary, all-BTS summary, daily breakdown,
-// Excel report, daily summary runner, and /ask endpoint.
-
 const express  = require('express');
 const router   = express.Router();
 const ExcelJS  = require('exceljs');
@@ -278,14 +274,14 @@ async function buildAndSendExcel(res, days, routersRes) {
   workbook.creator = 'Link3 Technologies LTD';
   workbook.created = new Date();
 
-  const reportDate     = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+  const reportDate     = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
   const periodLabelStr = days === 1 ? '1 Day' : days === 7 ? '7 Days' : '30 Days';
 
   // ── Which real-world dates this rolling window covers ──
   const now = new Date();
   const dateLabel = (days <= 1)
-    ? `Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
-    : `Start Date: ${new Date(now.getTime() - days * 86400000).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}  |  End Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`;
+    ? `Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' })}`
+    : `Start Date: ${new Date(now.getTime() - days * 86400000).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' })}  |  End Date: ${now.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' })}`;
 
   // ── Styles ──────────────────────────────────────────────
   const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
@@ -452,286 +448,6 @@ router.get('/analytics/report/excel/30d', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-//  "YESTERDAY" ANALYTICS — one full calendar day, the day
-//  before today. NOT a rolling window from "now" like
-//  /analytics/all — today is never included, since today
-//  isn't finished yet.
-//
-//  Computed LIVE directly from ping_history (not daily_summary),
-//  using fixed UTC calendar boundaries: yesterday 00:00:00 to
-//  yesterday 23:59:59.
-//
-//  Example: today = 2026-07-15 → yesterday = 2026-07-14
-//    range = 2026-07-14T00:00:00.000Z to 2026-07-14T23:59:59.999Z
-//  Example: today = 2026-07-14 → yesterday = 2026-07-13
-//    range = 2026-07-13T00:00:00.000Z to 2026-07-13T23:59:59.999Z
-// ══════════════════════════════════════════════════════════
-
-// Build yesterday's fixed start/end timestamps (UTC calendar day)
-function getYesterdayRange() {
-  const now = new Date();
-  const yesterday = new Date(Date.UTC(
-    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1
-  ));
-
-  const startTs = new Date(Date.UTC(
-    yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate(),
-    0, 0, 0, 0
-  ));
-  const endTs = new Date(Date.UTC(
-    yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate(),
-    23, 59, 59, 999
-  ));
-
-  return {
-    startTs,
-    endTs,
-    dateStr: startTs.toISOString().slice(0, 10),
-  };
-}
-
-// Same idea as computeStatsAllRouters(), but for a FIXED
-// [startTs, endTs] range instead of "N days back from now".
-async function computeStatsAllRoutersFixedRange(startTs, endTs) {
-  const statsSQL = `
-    SELECT
-      ip_address,
-      COALESCE(SUM(CASE WHEN status = 'Up'   THEN 30 ELSE 0 END), 0) AS up_seconds,
-      COALESCE(SUM(CASE WHEN status = 'Down' THEN 30 ELSE 0 END), 0) AS down_seconds
-    FROM ping_history
-    WHERE checked_at >= $1 AND checked_at <= $2
-    GROUP BY ip_address
-  `;
-  const incidentSQL = `
-    WITH d AS (
-      SELECT ip_address, status,
-        LAG(status) OVER (PARTITION BY ip_address ORDER BY checked_at) AS prev_status
-      FROM ping_history
-      WHERE checked_at >= $1 AND checked_at <= $2
-    )
-    SELECT ip_address, COUNT(*) AS cnt
-    FROM d
-    WHERE status = 'Down' AND prev_status = 'Up'
-    GROUP BY ip_address
-  `;
-
-  const [statsRes, incidentRes] = await Promise.all([
-    query(statsSQL,    [startTs, endTs]),
-    query(incidentSQL, [startTs, endTs]),
-  ]);
-
-  const incidentMap = new Map();
-  for (const row of incidentRes.rows) {
-    incidentMap.set(row.ip_address, parseInt(row.cnt) || 0);
-  }
-
-  return statsRes.rows.map(row => {
-    const up_seconds        = parseInt(row.up_seconds)   || 0;
-    const down_seconds      = parseInt(row.down_seconds) || 0;
-    const monitored_seconds = up_seconds + down_seconds;
-    const down_incidents    = incidentMap.get(row.ip_address) || 0;
-
-    const uptime_pct   = monitored_seconds > 0 ? Math.round((up_seconds   / monitored_seconds) * 10000) / 100 : 0;
-    const downtime_pct = monitored_seconds > 0 ? Math.round((down_seconds / monitored_seconds) * 10000) / 100 : 0;
-
-    return {
-      ip_address: row.ip_address,
-      up_seconds, down_seconds, monitored_seconds,
-      uptime_pct, downtime_pct, down_incidents,
-    };
-  });
-}
-
-// ══════════════════════════════════════════════════════════
-//  GET /api/analytics/yesterday
-//  All BTS, yesterday's full calendar day.
-// ══════════════════════════════════════════════════════════
-router.get('/analytics/yesterday', async (req, res) => {
-  try {
-    const routersRes = await query('SELECT bts_name, ip_address FROM routers ORDER BY bts_name');
-    if (routersRes.rowCount === 0) {
-      return res.json({ success: true, count: 0, data: [] });
-    }
-
-    const { startTs, endTs, dateStr } = getYesterdayRange();
-    const statsRows = await computeStatsAllRoutersFixedRange(startTs, endTs);
-    const statsMap  = new Map(statsRows.map(r => [r.ip_address, r]));
-
-    const data = routersRes.rows.map(r => {
-      const stats = statsMap.get(r.ip_address) || {
-        up_seconds: 0, down_seconds: 0, monitored_seconds: 0,
-        uptime_pct: 0, downtime_pct: 0, down_incidents: 0,
-      };
-      return {
-        bts_name:          r.bts_name,
-        ip_address:        r.ip_address,
-        up_seconds:        stats.up_seconds,
-        down_seconds:      stats.down_seconds,
-        monitored_seconds: stats.monitored_seconds,
-        uptime_pct:        stats.uptime_pct,
-        downtime_pct:      stats.downtime_pct,
-        down_incidents:    stats.down_incidents,
-      };
-    });
-
-    res.json({
-      success:    true,
-      date:       dateStr,
-      start_time: startTs.toISOString(),
-      end_time:   endTs.toISOString(),
-      count:      data.length,
-      data,
-    });
-  } catch (err) { serverError(res, err); }
-});
-
-// ══════════════════════════════════════════════════════════
-//  GET /api/analytics/yesterday/excel
-//  Excel report — all BTS, yesterday's full calendar day.
-// ══════════════════════════════════════════════════════════
-router.get('/analytics/yesterday/excel', async (req, res) => {
-  try {
-    const routersRes = await query('SELECT bts_name, ip_address FROM routers ORDER BY bts_name');
-    if (routersRes.rowCount === 0)
-      return res.status(404).json({ success: false, error: 'No routers found' });
-
-    const { startTs, endTs, dateStr } = getYesterdayRange();
-    const statsRows = await computeStatsAllRoutersFixedRange(startTs, endTs);
-    const statsMap  = new Map(statsRows.map(r => [r.ip_address, r]));
-
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'Link3 Technologies LTD';
-    workbook.created = new Date();
-
-    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const dataDate   = startTs.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const fmtTime    = d => d.toISOString().slice(11, 19) + ' UTC';
-
-    // ── Styles (same palette as the other Excel reports) ────
-    const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
-    const DEPT_FONT    = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
-    const DATE_FONT    = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF333333' } };
-    const HEADER_FONT  = { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
-    const CELL_FONT    = { name: 'Arial', size: 10 };
-    const BLUE_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1565C0' } };
-    const TEAL_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00695C' } };
-    const COL_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D47A1' } };
-    const ODD_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
-    const EVEN_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
-    const UP_FILL      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
-    const DOWN_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4EC' } };
-    const CENTER       = { horizontal: 'center', vertical: 'middle' };
-    const LEFT         = { horizontal: 'left',   vertical: 'middle' };
-    const BORDER       = {
-      top:    { style: 'thin', color: { argb: 'FFBDBDBD' } },
-      left:   { style: 'thin', color: { argb: 'FFBDBDBD' } },
-      bottom: { style: 'thin', color: { argb: 'FFBDBDBD' } },
-      right:  { style: 'thin', color: { argb: 'FFBDBDBD' } },
-    };
-
-    const COL_DEFS = [
-      { header: '#',              key: 'sl',             width: 5  },
-      { header: 'BTS Name',       key: 'bts_name',       width: 42 },
-      { header: 'IP Address',     key: 'ip_address',     width: 18 },
-      { header: 'Up Time',        key: 'up_time_fmt',    width: 16 },
-      { header: 'Down Time',      key: 'down_time_fmt',  width: 16 },
-      { header: 'Monitored Time', key: 'monitored_fmt',  width: 18 },
-      { header: 'Uptime %',       key: 'uptime_pct',     width: 12 },
-      { header: 'Downtime %',     key: 'downtime_pct',   width: 13 },
-      { header: 'Down Incidents', key: 'down_incidents', width: 17 },
-    ];
-
-    const ws = workbook.addWorksheet('Yesterday', {
-      pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true },
-    });
-    ws.columns = COL_DEFS.map(c => ({ key: c.key, width: c.width }));
-
-    ws.mergeCells('A1:I1');
-    Object.assign(ws.getCell('A1'), { value: 'Link3 Technologies LTD', font: COMPANY_FONT, fill: BLUE_FILL, alignment: CENTER });
-    ws.getRow(1).height = 28;
-
-    ws.mergeCells('A2:I2');
-    Object.assign(ws.getCell('A2'), { value: 'BTS and Power Department', font: DEPT_FONT, fill: TEAL_FILL, alignment: CENTER });
-    ws.getRow(2).height = 22;
-
-    ws.mergeCells('A3:I3');
-    Object.assign(ws.getCell('A3'), {
-      value: `Yesterday's Analytics Report  |  Date: ${dataDate}  |  Time: ${fmtTime(startTs)} to ${fmtTime(endTs)}  |  Generated: ${reportDate}`,
-      font: DATE_FONT, alignment: CENTER,
-      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE3F2FD' } },
-    });
-    ws.getRow(3).height = 18;
-    ws.getRow(4).height = 6;
-
-    const headerRow = ws.getRow(5);
-    COL_DEFS.forEach((col, i) => {
-      const cell = headerRow.getCell(i + 1);
-      cell.value = col.header;
-      cell.font = HEADER_FONT; cell.fill = COL_FILL;
-      cell.alignment = CENTER; cell.border = BORDER;
-    });
-    headerRow.height = 20;
-
-    routersRes.rows.forEach((router, idx) => {
-      const stats  = statsMap.get(router.ip_address) || {
-        up_seconds: 0, down_seconds: 0, monitored_seconds: 0,
-        uptime_pct: 0, downtime_pct: 0, down_incidents: 0,
-      };
-      const isOdd   = idx % 2 === 0;
-      const dataRow = ws.getRow(6 + idx);
-
-      const values = {
-        sl:             idx + 1,
-        bts_name:       router.bts_name,
-        ip_address:     router.ip_address,
-        up_time_fmt:    formatDurationHM(stats.up_seconds),
-        down_time_fmt:  formatDurationHM(stats.down_seconds),
-        monitored_fmt:  formatDurationHM(stats.monitored_seconds),
-        uptime_pct:     stats.uptime_pct,
-        downtime_pct:   stats.downtime_pct,
-        down_incidents: stats.down_incidents,
-      };
-
-      COL_DEFS.forEach((col, i) => {
-        const cell     = dataRow.getCell(i + 1);
-        cell.value     = values[col.key];
-        cell.font      = { ...CELL_FONT };
-        cell.border    = BORDER;
-        cell.alignment = (col.key === 'bts_name') ? LEFT : CENTER;
-
-        if (col.key === 'uptime_pct') {
-          cell.fill = UP_FILL;
-          cell.font = { ...CELL_FONT, color: { argb: 'FF1B5E20' }, bold: true };
-        } else if (col.key === 'downtime_pct') {
-          cell.fill = DOWN_FILL;
-          cell.font = { ...CELL_FONT, color: { argb: 'FFB71C1C' }, bold: true };
-        } else {
-          cell.fill = isOdd ? ODD_FILL : EVEN_FILL;
-        }
-      });
-      dataRow.height = 18;
-    });
-
-    const sumRowNum = 6 + routersRes.rowCount;
-    ws.mergeCells(`A${sumRowNum}:I${sumRowNum}`);
-    Object.assign(ws.getCell(`A${sumRowNum}`), {
-      value: `Total BTS: ${routersRes.rowCount}  |  Date: ${dataDate}`,
-      font: { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } },
-      fill: TEAL_FILL, alignment: LEFT,
-    });
-    ws.getRow(sumRowNum).height = 18;
-
-    const filename = `BTS_Yesterday_Report_${dateStr}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    await workbook.xlsx.write(res);
-    res.end();
-
-  } catch (err) { serverError(res, err); }
-});
-
-
-// ══════════════════════════════════════════════════════════
 //  CORE DAILY JOB — runs automatically every night (see
 //  src/scheduler.js) and can still be triggered manually.
 //
@@ -830,9 +546,13 @@ async function runDailyJob(targetDate) {
   // ── PART B — daily_events (Up/Down transition cycles) ──
   // Pull the day's raw rows plus 1 row of context before/after
   // so cycles that span midnight still get correct started_at/
-  // ended_at. We detect cycle starts (prev status differs) and
-  // cycle ends (next status differs), pair them by row order,
-  // then keep only cycles that overlap this calendar date.
+  // ended_at. Uses the "gaps and islands" technique — a single
+  // running counter groups every consecutive same-status streak
+  // together per router, so EVERY cycle is captured correctly:
+  // first or last, Up or Down, and critically, a router that
+  // never transitions at all within the window (e.g. always
+  // stays Up) still forms exactly one group covering the whole
+  // window, so it never silently produces zero events.
   const eventsSQL = `
     WITH window_rows AS (
       SELECT bts_name, ip_address, up_time, down_time,
@@ -844,37 +564,41 @@ async function runDailyJob(targetDate) {
     ),
     ranked AS (
       SELECT *,
-        LAG(status)  OVER (PARTITION BY ip_address ORDER BY checked_at) AS prev_status,
-        LEAD(status) OVER (PARTITION BY ip_address ORDER BY checked_at) AS next_status
+        LAG(status) OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS prev_status
       FROM window_rows
     ),
-    cycle_starts AS (
-      SELECT ip_address, checked_at AS started_at,
-        ROW_NUMBER() OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS rn
+    grouped AS (
+      SELECT *,
+        SUM(CASE WHEN prev_status IS NULL OR prev_status <> status THEN 1 ELSE 0 END)
+          OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS grp
       FROM ranked
-      WHERE prev_status IS NULL OR prev_status <> status
     ),
-    cycle_ends AS (
-      SELECT bts_name, ip_address, up_time, down_time,
-        up_time_last_24h, down_time_last_24h,
-        status, countdown, checked_at AS ended_at, next_status,
-        ROW_NUMBER() OVER (PARTITION BY ip_address ORDER BY checked_at ASC) AS rn
-      FROM ranked
-      WHERE next_status IS NULL OR next_status <> status
+    cycles AS (
+      SELECT
+        bts_name, ip_address, status, grp,
+        MIN(checked_at) AS started_at,
+        MAX(checked_at) AS last_seen_at,
+        (ARRAY_AGG(up_time            ORDER BY checked_at DESC))[1] AS up_time,
+        (ARRAY_AGG(down_time          ORDER BY checked_at DESC))[1] AS down_time,
+        (ARRAY_AGG(up_time_last_24h   ORDER BY checked_at DESC))[1] AS up_time_last_24h,
+        (ARRAY_AGG(down_time_last_24h ORDER BY checked_at DESC))[1] AS down_time_last_24h,
+        (ARRAY_AGG(countdown          ORDER BY checked_at DESC))[1] AS countdown
+      FROM grouped
+      GROUP BY bts_name, ip_address, status, grp
+    ),
+    final AS (
+      SELECT
+        bts_name, ip_address, up_time, down_time,
+        up_time_last_24h, down_time_last_24h, status, countdown,
+        started_at,
+        CASE WHEN grp = MAX(grp) OVER (PARTITION BY ip_address)
+             THEN NULL ELSE last_seen_at END AS ended_at
+      FROM cycles
     )
-    SELECT
-      ce.bts_name, ce.ip_address,
-      ce.up_time, ce.down_time,
-      ce.up_time_last_24h, ce.down_time_last_24h,
-      ce.status, ce.countdown,
-      cs.started_at,
-      CASE WHEN ce.next_status IS NULL THEN NULL ELSE ce.ended_at END AS ended_at
-    FROM cycle_ends ce
-    JOIN cycle_starts cs ON cs.ip_address = ce.ip_address AND cs.rn = ce.rn
-    WHERE cs.started_at <= $2::timestamptz
-      AND (ce.ended_at IS NULL OR ce.ended_at >= $1::timestamptz)
-      AND (ce.next_status IS NOT NULL OR cs.started_at >= $1::timestamptz - INTERVAL '1 day')
-    ORDER BY ce.ip_address, cs.started_at ASC
+    SELECT * FROM final
+    WHERE started_at <= $2::timestamptz
+      AND (ended_at IS NULL OR ended_at >= $1::timestamptz)
+    ORDER BY ip_address, started_at ASC
   `;
   const eventsRes = await query(eventsSQL, [startTs, endTs]);
 
@@ -987,8 +711,8 @@ router.get('/analytics/date/:date/excel', async (req, res) => {
     workbook.creator = 'Link3 Technologies LTD';
     workbook.created = new Date();
 
-    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const dataDate   = new Date(targetDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const dataDate   = new Date(targetDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
     const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
     const DEPT_FONT    = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
@@ -1144,8 +868,8 @@ router.get('/analytics/date/:date/:ip/excel', async (req, res) => {
     workbook.creator = 'Link3 Technologies LTD';
     workbook.created = new Date();
 
-    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const dataDate   = new Date(targetDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const dataDate   = new Date(targetDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
     const COMPANY_FONT  = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
     const DEPT_FONT     = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
@@ -1475,9 +1199,9 @@ router.get('/analytics/range/all/excel', async (req, res) => {
     workbook.creator = 'Link3 Technologies LTD';
     workbook.created = new Date();
 
-    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
     const COMPANY_FONT = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
     const DEPT_FONT    = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
@@ -1707,9 +1431,9 @@ router.get('/analytics/range/:ip/excel', async (req, res) => {
     workbook.creator = 'Link3 Technologies LTD';
     workbook.created = new Date();
 
-    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
-    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const reportDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const startFmt   = new Date(start).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const endFmt     = new Date(end).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
     const COMPANY_FONT  = { name: 'Arial', size: 14, bold: true, color: { argb: 'FFFFFFFF' } };
     const DEPT_FONT     = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
