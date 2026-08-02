@@ -16,6 +16,7 @@ const rateLimit  = require('express-rate-limit');
 const { testConnection } = require('./db');
 const routerRoutes = require('./routes/routers');
 const analyticsRoutes = require('./routes/analytics');
+const routerUpdateRoutes = require('./routes/routerUpdate');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -38,6 +39,7 @@ app.use('/api', limiter);
 // ── Routes ────────────────────────────────────
 app.use('/api/routers', routerRoutes);
 app.use('/api', analyticsRoutes);  // /api/ask, /api/analytics/*
+app.use('/api', routerUpdateRoutes); // /api/router-update
 
 // Health check
 app.get('/health', (req, res) => {
