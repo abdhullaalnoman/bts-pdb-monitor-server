@@ -59,6 +59,8 @@ router.get('/', async (req, res) => {
         COALESCE(s.down_time_last_24h, 0) AS down_time_last_24h,
         COALESCE(s.status,       'Unknown') AS status,
         COALESCE(s.countdown,          0) AS countdown,
+        s.battery_current_capacity,
+        s.battery_soc,
         s.updated_at
       FROM routers r
       LEFT JOIN router_status s ON r.ip_address = s.ip_address
@@ -234,6 +236,8 @@ router.get('/:ip', async (req, res) => {
         COALESCE(s.down_time_last_24h, 0) AS down_time_last_24h,
         COALESCE(s.status,       'Unknown') AS status,
         COALESCE(s.countdown,          0) AS countdown,
+        s.battery_current_capacity,
+        s.battery_soc,
         s.updated_at
       FROM routers r
       LEFT JOIN router_status s ON r.ip_address = s.ip_address

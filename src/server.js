@@ -18,6 +18,7 @@ const routerRoutes = require('./routes/routers');
 const analyticsRoutes = require('./routes/analytics');
 const routerUpdateRoutes = require('./routes/routerUpdate');
 const batteryInfoRoutes = require('./routes/batteryInfo');
+const batteryLatestDataRoutes = require('./routes/batteryLatestData');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -42,6 +43,7 @@ app.use('/api/routers', routerRoutes);
 app.use('/api', analyticsRoutes);  // /api/ask, /api/analytics/*
 app.use('/api', routerUpdateRoutes); // /api/router-update
 app.use('/api', batteryInfoRoutes);  // /api/battery-info/*
+app.use('/api', batteryLatestDataRoutes); // /api/battery-latest/*
 
 // Health check
 app.get('/health', (req, res) => {
