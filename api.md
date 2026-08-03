@@ -12,12 +12,6 @@ GET http://localhost:3000/api/routers/10.200.205.162/last-events
 GET http://localhost:3000/api/routers/10.200.205.162/last-events?limit=50&page=1
 
 
-<!-- POST http://localhost:3000/api/analytics/run-daily-summary
-POST http://localhost:3000/api/analytics/run-daily-summary?date=2026-06-08
-
-GET http://localhost:3000/api/analytics/daily-breakdown/10.200.205.162?days=7
-GET http://localhost:3000/api/analytics/daily-breakdown/10.200.205.162?days=30 -->
-
 Analytics & Reporting
 GET http://localhost:3000/api/analytics/all?period=1d
 GET http://localhost:3000/api/analytics/all?period=7d
@@ -53,6 +47,18 @@ http://localhost:3000/api/analytics/monthly/10.200.205.162?month=2026-06
 http://localhost:3000/api/analytics/monthly-range/10.200.205.162?start=2026-01&end=2026-06
 
 
+router update table
+http://localhost:3000/api/router-update
+http://localhost:3000/api/router-update/10.200.205.2
+
+battery info api
+POST http://localhost:3000/api/battery-info/upload?month=2026-06
+http://localhost:3000/api/battery-info?month=2026-06          
+http://localhost:3000/api/battery-info/months                    
+http://localhost:3000/api/battery-info/:bts_name?month=2026-06
+http://localhost:3000/api/battery-info/:bts_name/history          
+http://localhost:3000/api/battery-info/:bts_name?month=2026-06
+http://localhost:3000/api/battery-info/:bts_name?month=2026-06
 
 
 
@@ -115,3 +121,11 @@ POST http://localhost:3000/api/analytics/run-daily-summary?date=2026-06-08
 (No body needed)
 
 TRUNCATE TABLE ping_history, router_status, daily_summary;
+
+http://localhost:3000/api/router-update
+Content-Type: application/json
+
+{
+  "ip_address": "10.200.205.2",
+  "status": 1
+}
