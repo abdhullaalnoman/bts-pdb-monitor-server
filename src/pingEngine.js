@@ -260,8 +260,15 @@ function stepBattery(ip, status, batteryInfo, justConfirmed) {
   const b = batteryState[ip];
 
   // No battery_latest_data row (or no capacity value) for this IP —
-  // nothing to compute; leave whatever was last known untouched.
+  // e.g. the table was truncated, or this IP was never in the file.
+  // Clear it out (don't leave stale numbers sitting in router_status).
+  // Next time real data shows up for this IP, b.current === null
+  // below will re-initialize it fresh, starting full again.
   if (!batteryInfo || batteryInfo.totalCapacity === null) {
+    b.current = null;
+    b.soc = null;
+    b.upAccum = 0;
+    b.downAccum = 0;
     return b;
   }
   const totalCapacity = batteryInfo.totalCapacity;

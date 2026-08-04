@@ -19,7 +19,9 @@ router.get('/status/down', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.countdown, s.updated_at
+        s.status, s.countdown,
+        s.battery_current_capacity, s.battery_soc,
+        s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
       WHERE s.status = 'Down'
@@ -37,7 +39,9 @@ router.get('/status/up', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.countdown, s.updated_at
+        s.status, s.countdown,
+        s.battery_current_capacity, s.battery_soc,
+        s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
       WHERE s.status = 'Up'
