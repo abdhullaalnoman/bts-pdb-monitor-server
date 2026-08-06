@@ -51,14 +51,24 @@ router update table
 http://localhost:3000/api/router-update
 http://localhost:3000/api/router-update/10.200.205.2
 
-battery info api
-POST http://localhost:3000/api/battery-info/upload?month=2026-06
-http://localhost:3000/api/battery-info?month=2026-06          
-http://localhost:3000/api/battery-info/months                    
-http://localhost:3000/api/battery-info/:bts_name?month=2026-06
-http://localhost:3000/api/battery-info/:bts_name/history          
-http://localhost:3000/api/battery-info/:bts_name?month=2026-06
-http://localhost:3000/api/battery-info/:bts_name?month=2026-06
+POST   http://localhost:3000/api/battery-info/upload
+GET    http://localhost:3000/api/battery-info
+GET    http://localhost:3000/api/battery-info?month=YYYY-MM
+GET    http://localhost:3000/api/battery-info/months
+GET    http://localhost:3000/api/battery-info/:bts_name
+GET    http://localhost:3000/api/battery-info/:bts_name?month=YYYY-MM
+GET    http://localhost:3000/api/battery-info/:bts_name/history
+PUT    http://localhost:3000/api/battery-info/:bts_name
+PUT    http://localhost:3000/api/battery-info/:bts_name?month=YYYY-MM
+DELETE http://localhost:3000/api/battery-info/:bts_name?month=YYYY-MM
+
+POST   http://localhost:3000/api/battery-latest/upload
+GET    http://localhost:3000/api/battery-latest
+GET    http://localhost:3000/api/battery-latest/:ip
+GET    http://localhost:3000/api/battery-latest/search/by-name/:bts_name
+PUT    http://localhost:3000/api/battery-latest/:ip
+DELETE http://localhost:3000/api/battery-latest/:ip
+
 
 
 
