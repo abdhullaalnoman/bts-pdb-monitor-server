@@ -1,3 +1,9 @@
+// src/pingEngine.js — Production ICMP ping engine
+// Windows ICMP ping | 40 routers per batch
+// | countdown-based down detection WITH retroactive correction
+// | batched DB writes (2 queries per cycle, +1 tiny correction
+//   query only on the rare cycle a router gets confirmed Down)
+
 require('dotenv').config();
 const ping = require('ping');
 const { query } = require('./db');
@@ -7,16 +13,21 @@ const BATCH_SIZE           = parseInt(process.env.PING_BATCH_SIZE)      || 40;
 const COUNTDOWN_THRESHOLD  = parseInt(process.env.COUNTDOWN_THRESHOLD)  || 10;
 const PING_TIMEOUT_S       = Math.floor((parseInt(process.env.PING_TIMEOUT_MS) || 3000) / 1000);
 
-
+// In-memory state per router (keyed by ip_address)
+// { upTime, downTime, status, countdown }
 const routerState = {};
 
+// In-memory battery state per router (keyed by ip_address).
+// { current, soc, upAccum, downAccum } — preloaded from
+// router_status at startup so a restart picks up where it left off.
 const batteryState = {};
 
+// ─── Ping a single IP with Windows ICMP (single attempt, no retry) ──────────
 async function pingOne(ip) {
   try {
-     const res = await ping.promise.probe(ip, {
+    const res = await ping.promise.probe(ip, {
       timeout: PING_TIMEOUT_S,
-      extra: process.platform === 'win32' ? ['-n', '1'] : ['-c', '1'],
+      extra:   ['-n', '1'],   // Windows: -n 1 (send 1 packet)
     });
     return res.alive;
   } catch {
@@ -34,6 +45,28 @@ async function pingBatch(routers) {
   );
 }
 
+// ─── Update in-memory state using countdown logic ───────────────────────────
+//
+//  alive=true:
+//    countdown = 0, status = 'Up', up_time += 30, down_time = 0
+//
+//  alive=false:
+//    countdown += 1 (capped at COUNTDOWN_THRESHOLD)
+//    countdown 1..(THRESHOLD-1) → still reported 'Up' (grace period),
+//                                  up_time keeps growing normally
+//    countdown == THRESHOLD     → CONFIRMED DOWN this cycle.
+//                                  The entire grace window (the previous
+//                                  THRESHOLD-1 cycles that were stored as
+//                                  'Up') is now retroactively wrong — the
+//                                  router was actually down that whole
+//                                  time. down_time jumps straight to
+//                                  THRESHOLD*30 (the full confirmed
+//                                  window), and justConfirmed=true is
+//                                  returned so runPingCycle() can fix
+//                                  those already-written history rows.
+//    countdown stays == THRESHOLD on later cycles (still down) →
+//                                  down_time keeps growing normally (+30)
+//
 function updateState(ip, alive) {
   if (!routerState[ip]) {
     routerState[ip] = { upTime: 0, downTime: 0, status: 'Unknown', countdown: 0 };
@@ -56,13 +89,17 @@ function updateState(ip, alive) {
       s.upTime   += 30;
       s.downTime  = 0;
     } else {
+      // confirmed down (countdown just hit, or already sitting at, threshold)
       s.status = 'Down';
       s.upTime = 0;
 
       if (wasBelowThreshold) {
+        // this is the exact cycle the countdown reached the threshold —
+        // the whole grace window is now retroactively "was actually down"
         justConfirmed = true;
         s.downTime = COUNTDOWN_THRESHOLD * 30;
       } else {
+        // already confirmed down previously, still down, keep growing
         s.downTime += 30;
       }
     }
@@ -92,6 +129,11 @@ async function get24hSumsForAll() {
   return map;
 }
 
+// ─── For a router that just got confirmed Down, find the 24h up/down ───────
+// ─── sums as they stood right BEFORE its grace period began (i.e. skip ─────
+// ─── over the THRESHOLD-1 rows that are about to be corrected). This is ────
+// ─── called BEFORE the correction UPDATE runs, so these 9 rows still ──────
+// ─── exist as 'Up' at this point — we just skip past them with OFFSET. ─────
 async function getPreGraceSums(ip) {
   const sql = `
     SELECT up_time_last_24h, down_time_last_24h
@@ -109,6 +151,24 @@ async function getPreGraceSums(ip) {
   };
 }
 
+// ─── Retroactively flip the last (THRESHOLD-1) history rows for this IP ─────
+// ─── from Up → Down, now that the router has been confirmed Down. ──────────
+//
+//  FIX #1 — matches rows by ip_address + checked_at (real, stable, unique
+//  column values) instead of ctid. ping_history is a TimescaleDB hypertable,
+//  internally split into per-time-range chunks — ctid is only unique WITHIN
+//  a single physical chunk, so a CTE-vs-UPDATE join on ctid alone can
+//  silently fail to match rows. Matching on real column values guarantees
+//  every intended row is actually found and updated.
+//
+//  FIX #2 — this function MUST be called (from runPingCycle, below) BEFORE
+//  the current cycle's new row is inserted into ping_history. If the new
+//  row were already inserted first, "the last 9 rows" would incorrectly
+//  include that brand-new row, shifting the window by one and leaving the
+//  oldest real grace row (countdown=1) stuck as 'Up' while rows 2-10 became
+//  'Down'. Calling this first guarantees exactly rows 1-9 (the true grace
+//  window) get corrected, and the current cycle's own row (inserted next)
+//  becomes the 10th Down row.
 async function correctGraceWindow(ip, preGrace) {
   const graceRows = COUNTDOWN_THRESHOLD - 1;
   if (graceRows <= 0) return;
@@ -140,15 +200,16 @@ async function preloadBatteryState() {
   try {
     const res = await query(`
       SELECT ip_address, battery_current_capacity, battery_soc,
-             battery_up_accum_sec, battery_down_accum_sec
+             battery_up_accum_sec, battery_down_accum_sec, battery_source_updated_at
       FROM router_status
     `);
     for (const row of res.rows) {
       batteryState[row.ip_address] = {
-        current:   row.battery_current_capacity !== null ? parseFloat(row.battery_current_capacity) : null,
-        soc:       row.battery_soc              !== null ? parseFloat(row.battery_soc)              : null,
-        upAccum:   row.battery_up_accum_sec   || 0,
-        downAccum: row.battery_down_accum_sec || 0,
+        current:        row.battery_current_capacity !== null ? parseFloat(row.battery_current_capacity) : null,
+        soc:            row.battery_soc              !== null ? parseFloat(row.battery_soc)              : null,
+        upAccum:        row.battery_up_accum_sec   || 0,
+        downAccum:      row.battery_down_accum_sec || 0,
+        sourceUpdatedAt: row.battery_source_updated_at || null,
       };
     }
     console.log(`[PING ENGINE] Preloaded battery state for ${res.rowCount} router(s)`);
@@ -157,18 +218,21 @@ async function preloadBatteryState() {
   }
 }
 
+// ─── Get Total_Battery_Capacity / charging / discharging ampere ─────────────
+// ─── for every IP from battery_latest_data, in ONE query ───────────────────
 async function getBatteryLatestMap() {
   const map = new Map();
   try {
     const res = await query(`
-      SELECT ip_address, total_battery_capacity, total_charging_ampere, total_discharging_ampere
+      SELECT ip_address, total_battery_capacity, total_charging_ampere, total_discharging_ampere, updated_at
       FROM battery_latest_data
     `);
     for (const row of res.rows) {
       map.set(row.ip_address, {
-        totalCapacity: row.total_battery_capacity      !== null ? parseFloat(row.total_battery_capacity)      : null,
-        chargeAmp:     row.total_charging_ampere        !== null ? parseFloat(row.total_charging_ampere)       : null,
-        dischargeAmp:  row.total_discharging_ampere     !== null ? parseFloat(row.total_discharging_ampere)    : null,
+        totalCapacity:   row.total_battery_capacity  !== null ? parseFloat(row.total_battery_capacity)  : null,
+        chargeAmp:       row.total_charging_ampere    !== null ? parseFloat(row.total_charging_ampere)   : null,
+        dischargeAmp:    row.total_discharging_ampere !== null ? parseFloat(row.total_discharging_ampere): null,
+        sourceUpdatedAt: row.updated_at,
       });
     }
   } catch (err) {
@@ -177,23 +241,60 @@ async function getBatteryLatestMap() {
   return map;
 }
 
+// ─── Step battery_current_capacity / battery_soc for one router ────────────
+//
+//  Runs every ping cycle (30s), but the charge/discharge step itself
+//  only actually happens once enough continuous Up (or Down) seconds
+//  have accumulated to cross a full 1-minute boundary — a status flip
+//  resets the OTHER direction's accumulator to 0 so a brief blip
+//  doesn't carry over a stale partial minute.
+//
+//  Up   1 min -> current = min(total, current + charge_ampere / 60)
+//  Down 1 min -> current = max(0,     current - discharge_ampere / 60)
+//
+//  If current is already at total (charging) or already at 0
+//  (discharging), it simply stops moving in that direction — the
+//  min()/max() clamps handle that automatically.
 function stepBattery(ip, status, batteryInfo, justConfirmed) {
   if (!batteryState[ip]) {
-    batteryState[ip] = { current: null, soc: null, upAccum: 0, downAccum: 0 };
+    batteryState[ip] = { current: null, soc: null, upAccum: 0, downAccum: 0, sourceUpdatedAt: null };
   }
   const b = batteryState[ip];
 
+  // No battery_latest_data row (or no capacity value) for this IP —
+  // e.g. the table was truncated, or this IP was never in the file.
+  // Clear it out (don't leave stale numbers sitting in router_status).
+  // Next time real data shows up for this IP, b.current === null
+  // below will re-initialize it fresh, starting full again.
   if (!batteryInfo || batteryInfo.totalCapacity === null) {
     b.current = null;
     b.soc = null;
     b.upAccum = 0;
     b.downAccum = 0;
+    b.sourceUpdatedAt = null;
     return b;
   }
   const totalCapacity = batteryInfo.totalCapacity;
 
-  // First time we see this IP with real battery data — start full.
-  if (b.current === null) b.current = totalCapacity;
+  // Has this IP's row in battery_latest_data been re-uploaded since
+  // we last stepped it? (its updated_at moved). If so, don't keep
+  // charging/discharging the OLD number — re-sync straight to the
+  // NEW total capacity, same as a brand-new IP. This is what makes a
+  // fresh Excel upload take effect immediately, live, no restart.
+  //
+  // Compared as raw timestamp strings/values, not "both must already
+  // be known" — ANY difference (including going from unknown -> known
+  // right after a fresh migration_v9 deploy) counts as a re-upload.
+  const prevTime = b.sourceUpdatedAt ? new Date(b.sourceUpdatedAt).getTime() : null;
+  const newTime  = batteryInfo.sourceUpdatedAt ? new Date(batteryInfo.sourceUpdatedAt).getTime() : null;
+  const reUploaded = newTime !== prevTime;
+
+  if (b.current === null || reUploaded) {
+    b.current = totalCapacity;
+    b.upAccum = 0;
+    b.downAccum = 0;
+  }
+  b.sourceUpdatedAt = batteryInfo.sourceUpdatedAt;
 
   if (status === 'Up') {
     b.downAccum = 0;
@@ -208,6 +309,14 @@ function stepBattery(ip, status, batteryInfo, justConfirmed) {
   } else if (status === 'Down') {
     b.upAccum = 0;
 
+    // This is the exact cycle the grace window got retroactively
+    // confirmed Down (down_time just jumped to COUNTDOWN_THRESHOLD*30,
+    // e.g. 300s/5min, in ping_history + router_status). The battery
+    // was actually discharging that whole grace window too, but
+    // stepBattery() only saw status='Up' during those cycles — so
+    // catch up here by crediting the FULL confirmed window at once
+    // instead of just this cycle's 30s, keeping battery in sync with
+    // down_time/down_time_last_24h.
     b.downAccum += justConfirmed ? COUNTDOWN_THRESHOLD * 30 : 30;
 
     while (b.downAccum >= 60) {
@@ -231,7 +340,7 @@ function buildBatchUpsertStatus(rows) {
     'bts_name', 'ip_address', 'up_time', 'down_time',
     'up_time_last_24h', 'down_time_last_24h', 'status', 'countdown',
     'battery_current_capacity', 'battery_soc',
-    'battery_up_accum_sec', 'battery_down_accum_sec',
+    'battery_up_accum_sec', 'battery_down_accum_sec', 'battery_source_updated_at',
   ];
   const valuesSql = [];
   const params = [];
@@ -247,18 +356,19 @@ function buildBatchUpsertStatus(rows) {
     INSERT INTO router_status (${cols.join(',')}, updated_at)
     VALUES ${valuesSql.join(',')}
     ON CONFLICT (ip_address) DO UPDATE SET
-      bts_name                 = EXCLUDED.bts_name,
-      up_time                  = EXCLUDED.up_time,
-      down_time                = EXCLUDED.down_time,
-      up_time_last_24h         = EXCLUDED.up_time_last_24h,
-      down_time_last_24h       = EXCLUDED.down_time_last_24h,
-      status                   = EXCLUDED.status,
-      countdown                = EXCLUDED.countdown,
-      battery_current_capacity = EXCLUDED.battery_current_capacity,
-      battery_soc               = EXCLUDED.battery_soc,
-      battery_up_accum_sec      = EXCLUDED.battery_up_accum_sec,
-      battery_down_accum_sec    = EXCLUDED.battery_down_accum_sec,
-      updated_at               = NOW()
+      bts_name                  = EXCLUDED.bts_name,
+      up_time                   = EXCLUDED.up_time,
+      down_time                 = EXCLUDED.down_time,
+      up_time_last_24h          = EXCLUDED.up_time_last_24h,
+      down_time_last_24h        = EXCLUDED.down_time_last_24h,
+      status                    = EXCLUDED.status,
+      countdown                 = EXCLUDED.countdown,
+      battery_current_capacity  = EXCLUDED.battery_current_capacity,
+      battery_soc                = EXCLUDED.battery_soc,
+      battery_up_accum_sec       = EXCLUDED.battery_up_accum_sec,
+      battery_down_accum_sec     = EXCLUDED.battery_down_accum_sec,
+      battery_source_updated_at  = EXCLUDED.battery_source_updated_at,
+      updated_at                = NOW()
   `;
   return { sql, params };
 }
@@ -322,6 +432,9 @@ async function runPingCycle() {
     allResults.push(...results);
   }
 
+  // ── Get 24h sums for all routers in ONE query (used for every router ──
+  // ── EXCEPT ones that just got confirmed Down this exact cycle — those ──
+  // ── use getPreGraceSums() instead, fetched further below) ──────────────
   let sums;
   try {
     sums = await get24hSumsForAll();
@@ -329,14 +442,25 @@ async function runPingCycle() {
     console.error('[PING ENGINE] Failed to get 24h sums:', err.message);
     sums = new Map();
   }
+
+  // ── Get battery_latest_data (Total_Battery_Capacity / charge / ──
+  // ── discharge ampere per IP) in ONE query, used to step every ────
+  // ── router's battery_current_capacity / battery_soc below. ───────
   const batteryMap = await getBatteryLatestMap();
 
+  // ── Pass 1: update in-memory state for every router, note which ──
+  // ── ones just crossed the confirmation threshold this cycle ──────
   const updated = allResults.map(r => {
     const state = updateState(r.ip_address, r.alive);
     return { ...r, state };
   });
   const justConfirmedIps = updated.filter(u => u.state.justConfirmed).map(u => u.ip_address);
 
+  // ── Pass 2: for any just-confirmed router, fetch the 24h sums as ──
+  // ── they stood BEFORE its grace period began (small extra query, ──
+  // ── only runs on the rare cycle a router flips to confirmed Down). ──
+  // ── This MUST run before the correction UPDATE below, since it ──────
+  // ── relies on the 9 grace rows still being 'Up' at this point. ───────
   const preGraceMap = new Map();
   for (const ip of justConfirmedIps) {
     try {
@@ -382,6 +506,7 @@ async function runPingCycle() {
       battery_soc:              batt.soc,
       battery_up_accum_sec:     batt.upAccum,
       battery_down_accum_sec:   batt.downAccum,
+      battery_source_updated_at: batt.sourceUpdatedAt,
     };
   });
 
@@ -390,8 +515,24 @@ async function runPingCycle() {
     const { sql, params } = buildBatchUpsertStatus(rows);
     await query(sql, params);
   } catch (err) {
-    console.error('[PING ENGINE] Batch upsert (router_status) failed:', err.message);
+    console.error('════════════════════════════════════════════════════════');
+    console.error('[PING ENGINE] router_status batch upsert FAILED:', err.message);
+    console.error('[PING ENGINE] This means up_time/down_time/status/battery');
+    console.error('[PING ENGINE] were NOT written this cycle for ANY router.');
+    console.error('[PING ENGINE] If the error mentions a missing column, run');
+    console.error('[PING ENGINE] the latest database/migration_v*.sql files.');
+    console.error('════════════════════════════════════════════════════════');
   }
+
+  // ── Retroactive correction — MUST run BEFORE this cycle's ping_history ──
+  // ── insert below. correctGraceWindow() selects "the last 9 rows for ──────
+  // ── this IP" — if the current cycle's new row were already inserted ─────
+  // ── first, that new row would occupy one of those 9 slots and push the ──
+  // ── oldest real grace row (countdown=1) out of the window, leaving it ────
+  // ── incorrectly stuck as 'Up' while rows 2–10 became 'Down'. Running ─────
+  // ── this first guarantees exactly rows 1–9 (the true grace window) get ──
+  // ── corrected, and the current cycle's own row (inserted next, below) ────
+  // ── becomes the 10th Down row. ────────────────────────────────────────────
   for (const ip of justConfirmedIps) {
     try {
       const preGrace = preGraceMap.get(ip) || { up24: 0, down24: 0 };
@@ -414,6 +555,8 @@ async function runPingCycle() {
   const extraWrites = justConfirmedIps.length;
   console.log(`[PING ENGINE] ── Cycle done in ${elapsed}s (2 DB writes${extraWrites ? ` + ${extraWrites} correction write(s)` : ''})\n`);
 }
+
+// ─── Start the engine ────────────────────────────────────────────────────────
 async function start() {
   console.log('[PING ENGINE] Starting...');
   console.log(`  Interval           : ${PING_INTERVAL_MS / 1000}s`);

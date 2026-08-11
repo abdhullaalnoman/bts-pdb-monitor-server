@@ -19,9 +19,20 @@ router.get('/status/down', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.countdown, s.updated_at
+        s.status, s.countdown,
+        s.battery_current_capacity,
+        s.battery_soc,
+        CASE
+          WHEN b.total_discharging_ampere IS NULL
+            OR b.total_discharging_ampere = 0
+            OR s.battery_current_capacity IS NULL
+          THEN NULL
+          ELSE ROUND(s.battery_current_capacity / b.total_discharging_ampere, 2)
+        END AS backup_hour,
+        s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
+      LEFT JOIN battery_latest_data b ON r.ip_address = b.ip_address
       WHERE s.status = 'Down'
       ORDER BY s.down_time DESC
     `;
@@ -37,9 +48,20 @@ router.get('/status/up', async (req, res) => {
       SELECT r.bts_name, r.ip_address,
         s.up_time, s.down_time,
         s.up_time_last_24h, s.down_time_last_24h,
-        s.status, s.countdown, s.updated_at
+        s.status, s.countdown,
+        s.battery_current_capacity,
+        s.battery_soc,
+        CASE
+          WHEN b.total_discharging_ampere IS NULL
+            OR b.total_discharging_ampere = 0
+            OR s.battery_current_capacity IS NULL
+          THEN NULL
+          ELSE ROUND(s.battery_current_capacity / b.total_discharging_ampere, 2)
+        END AS backup_hour,
+        s.updated_at
       FROM routers r
       JOIN router_status s ON r.ip_address = s.ip_address
+      LEFT JOIN battery_latest_data b ON r.ip_address = b.ip_address
       WHERE s.status = 'Up'
       ORDER BY s.up_time DESC
     `;
